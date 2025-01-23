@@ -14,10 +14,11 @@ pub use self::book::{load_book, Book, BookItem, BookItems, Chapter};
 pub use self::init::BookBuilder;
 pub use self::summary::{parse_summary, Link, SectionNumber, Summary, SummaryItem};
 
-use std::io::Write;
-use std::path::PathBuf;
+use log::{debug, error, info, log_enabled, trace, warn};
+use std::ffi::OsString;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::string::ToString;
 use tempfile::Builder as TempFileBuilder;
 use toml::Value;
 use topological_sort::TopologicalSort;
@@ -70,22 +71,28 @@ impl MDBook {
 
         config.update_from_env();
 
-        if config
-            .html_config()
-            .map_or(false, |html| html.google_analytics.is_some())
-        {
-            warn!(
-                "The output.html.google-analytics field has been deprecated; \
-                 it will be removed in a future release.\n\
-                 Consider placing the appropriate site tag code into the \
-                 theme/head.hbs file instead.\n\
-                 The tracking code may be found in the Google Analytics Admin page.\n\
-               "
-            );
+        if let Some(html_config) = config.html_config() {
+            if html_config.google_analytics.is_some() {
+                warn!(
+                    "The output.html.google-analytics field has been deprecated; \
+                     it will be removed in a future release.\n\
+                     Consider placing the appropriate site tag code into the \
+                     theme/head.hbs file instead.\n\
+                     The tracking code may be found in the Google Analytics Admin page.\n\
+                   "
+                );
+            }
+            if html_config.curly_quotes {
+                warn!(
+                    "The output.html.curly-quotes field has been renamed to \
+                     output.html.smart-punctuation.\n\
+                     Use the new name in book.toml to remove this warning."
+                );
+            }
         }
 
         if log_enabled!(log::Level::Trace) {
-            for line in format!("Config: {:#?}", config).lines() {
+            for line in format!("Config: {config:#?}").lines() {
                 trace!("{}", line);
             }
         }
@@ -98,7 +105,7 @@ impl MDBook {
         let root = book_root.into();
 
         let src_dir = root.join(&config.book.src);
-        let book = book::load_book(&src_dir, &config.build)?;
+        let book = book::load_book(src_dir, &config.build)?;
 
         let renderers = determine_renderers(&config);
         let preprocessors = determine_preprocessors(&config)?;
@@ -121,7 +128,7 @@ impl MDBook {
         let root = book_root.into();
 
         let src_dir = root.join(&config.book.src);
-        let book = book::load_book_from_disk(&summary, &src_dir)?;
+        let book = book::load_book_from_disk(&summary, src_dir)?;
 
         let renderers = determine_renderers(&config);
         let preprocessors = determine_preprocessors(&config)?;
@@ -195,21 +202,26 @@ impl MDBook {
         Ok(())
     }
 
-    /// Run the entire build process for a particular [`Renderer`].
-    pub fn execute_build_process(&self, renderer: &dyn Renderer) -> Result<()> {
-        let mut preprocessed_book = self.book.clone();
+    /// Run preprocessors and return the final book.
+    pub fn preprocess_book(&self, renderer: &dyn Renderer) -> Result<(Book, PreprocessorContext)> {
         let preprocess_ctx = PreprocessorContext::new(
             self.root.clone(),
             self.config.clone(),
             renderer.name().to_string(),
         );
-
+        let mut preprocessed_book = self.book.clone();
         for preprocessor in &self.preprocessors {
             if preprocessor_should_run(&**preprocessor, renderer, &self.config) {
                 debug!("Running the {} preprocessor.", preprocessor.name());
                 preprocessed_book = preprocessor.run(&preprocess_ctx, preprocessed_book)?;
             }
         }
+        Ok((preprocessed_book, preprocess_ctx))
+    }
+
+    /// Run the entire build process for a particular [`Renderer`].
+    pub fn execute_build_process(&self, renderer: &dyn Renderer) -> Result<()> {
+        let (preprocessed_book, preprocess_ctx) = self.preprocess_book(renderer)?;
 
         let name = renderer.name();
         let build_dir = self.build_dir_for(name);
@@ -246,22 +258,52 @@ impl MDBook {
 
     /// Run `rustdoc` tests on the book, linking against the provided libraries.
     pub fn test(&mut self, library_paths: Vec<&str>) -> Result<()> {
-        let library_args: Vec<&str> = (0..library_paths.len())
-            .map(|_| "-L")
-            .zip(library_paths.into_iter())
-            .flat_map(|x| vec![x.0, x.1])
+        // test_chapter with chapter:None will run all tests.
+        self.test_chapter(library_paths, None)
+    }
+
+    /// Run `rustdoc` tests on a specific chapter of the book, linking against the provided libraries.
+    /// If `chapter` is `None`, all tests will be run.
+    pub fn test_chapter(&mut self, library_paths: Vec<&str>, chapter: Option<&str>) -> Result<()> {
+        let cwd = std::env::current_dir()?;
+        let library_args: Vec<OsString> = library_paths
+            .into_iter()
+            .flat_map(|path| {
+                let path = Path::new(path);
+                let path = if path.is_relative() {
+                    cwd.join(path).into_os_string()
+                } else {
+                    path.to_path_buf().into_os_string()
+                };
+                [OsString::from("-L"), path]
+            })
             .collect();
 
         let temp_dir = TempFileBuilder::new().prefix("mdbook-").tempdir()?;
 
-        // FIXME: Is "test" the proper renderer name to use here?
-        let preprocess_context =
-            PreprocessorContext::new(self.root.clone(), self.config.clone(), "test".to_string());
+        let mut chapter_found = false;
 
-        let book = LinkPreprocessor::new().run(&preprocess_context, self.book.clone())?;
-        // Index Preprocessor is disabled so that chapter paths continue to point to the
-        // actual markdown files.
+        struct TestRenderer;
+        impl Renderer for TestRenderer {
+            // FIXME: Is "test" the proper renderer name to use here?
+            fn name(&self) -> &str {
+                "test"
+            }
 
+            fn render(&self, _: &RenderContext) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // Index Preprocessor is disabled so that chapter paths
+        // continue to point to the actual markdown files.
+        self.preprocessors = determine_preprocessors(&self.config)?
+            .into_iter()
+            .filter(|pre| pre.name() != IndexPreprocessor::NAME)
+            .collect();
+        let (book, _) = self.preprocess_book(&TestRenderer)?;
+
+        let color_output = std::io::stderr().is_terminal();
         let mut failed = false;
         for item in book.iter() {
             if let BookItem::Chapter(ref ch) = *item {
@@ -270,31 +312,50 @@ impl MDBook {
                     _ => continue,
                 };
 
-                let path = self.source_dir().join(&chapter_path);
-                info!("Testing file: {:?}", path);
+                if let Some(chapter) = chapter {
+                    if ch.name != chapter && chapter_path.to_str() != Some(chapter) {
+                        if chapter == "?" {
+                            info!("Skipping chapter '{}'...", ch.name);
+                        }
+                        continue;
+                    }
+                }
+                chapter_found = true;
+                info!("Testing chapter '{}': {:?}", ch.name, chapter_path);
 
                 // write preprocessed file to tempdir
-                let path = temp_dir.path().join(&chapter_path);
+                let path = temp_dir.path().join(chapter_path);
                 let mut tmpf = utils::fs::create_file(&path)?;
                 tmpf.write_all(ch.content.as_bytes())?;
 
                 let mut cmd = Command::new("rustdoc");
-                cmd.arg(&path).arg("--test").args(&library_args);
+                cmd.current_dir(temp_dir.path())
+                    .arg(chapter_path)
+                    .arg("--test")
+                    .args(&library_args);
 
                 if let Some(edition) = self.config.rust.edition {
                     match edition {
                         RustEdition::E2015 => {
-                            cmd.args(&["--edition", "2015"]);
+                            cmd.args(["--edition", "2015"]);
                         }
                         RustEdition::E2018 => {
-                            cmd.args(&["--edition", "2018"]);
+                            cmd.args(["--edition", "2018"]);
                         }
                         RustEdition::E2021 => {
-                            cmd.args(&["--edition", "2021"]);
+                            cmd.args(["--edition", "2021"]);
+                        }
+                        RustEdition::E2024 => {
+                            cmd.args(["--edition", "2024"]);
                         }
                     }
                 }
 
+                if color_output {
+                    cmd.args(["--color", "always"]);
+                }
+
+                debug!("running {:?}", cmd);
                 let output = cmd.output()?;
 
                 if !output.status.success() {
@@ -310,6 +371,11 @@ impl MDBook {
         }
         if failed {
             bail!("One or more tests failed");
+        }
+        if let Some(chapter) = chapter {
+            if !chapter_found {
+                bail!("Chapter not found: {}", chapter);
+            }
         }
         Ok(())
     }
@@ -386,7 +452,7 @@ fn determine_renderers(config: &Config) -> Vec<Box<dyn Renderer>> {
     renderers
 }
 
-const DEFAULT_PREPROCESSORS: &[&'static str] = &["links", "index"];
+const DEFAULT_PREPROCESSORS: &[&str] = &["links", "index"];
 
 fn is_default_preprocessor(pre: &dyn Preprocessor) -> bool {
     let name = pre.name();
@@ -417,15 +483,13 @@ fn determine_preprocessors(config: &Config) -> Result<Vec<Box<dyn Preprocessor>>
             if let Some(before) = table.get("before") {
                 let before = before.as_array().ok_or_else(|| {
                     Error::msg(format!(
-                        "Expected preprocessor.{}.before to be an array",
-                        name
+                        "Expected preprocessor.{name}.before to be an array"
                     ))
                 })?;
                 for after in before {
                     let after = after.as_str().ok_or_else(|| {
                         Error::msg(format!(
-                            "Expected preprocessor.{}.before to contain strings",
-                            name
+                            "Expected preprocessor.{name}.before to contain strings"
                         ))
                     })?;
 
@@ -444,16 +508,12 @@ fn determine_preprocessors(config: &Config) -> Result<Vec<Box<dyn Preprocessor>>
 
             if let Some(after) = table.get("after") {
                 let after = after.as_array().ok_or_else(|| {
-                    Error::msg(format!(
-                        "Expected preprocessor.{}.after to be an array",
-                        name
-                    ))
+                    Error::msg(format!("Expected preprocessor.{name}.after to be an array"))
                 })?;
                 for before in after {
                     let before = before.as_str().ok_or_else(|| {
                         Error::msg(format!(
-                            "Expected preprocessor.{}.after to contain strings",
-                            name
+                            "Expected preprocessor.{name}.after to contain strings"
                         ))
                     })?;
 
@@ -515,7 +575,7 @@ fn get_custom_preprocessor_cmd(key: &str, table: &Value) -> String {
         .get("command")
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .unwrap_or_else(|| format!("mdbook-{}", key))
+        .unwrap_or_else(|| format!("mdbook-{key}"))
 }
 
 fn interpret_custom_renderer(key: &str, table: &Value) -> Box<CmdRenderer> {
@@ -526,7 +586,7 @@ fn interpret_custom_renderer(key: &str, table: &Value) -> Box<CmdRenderer> {
         .and_then(Value::as_str)
         .map(ToString::to_string);
 
-    let command = table_dot_command.unwrap_or_else(|| format!("mdbook-{}", key));
+    let command = table_dot_command.unwrap_or_else(|| format!("mdbook-{key}"));
 
     Box::new(CmdRenderer::new(key.to_string(), command))
 }
@@ -564,7 +624,7 @@ fn preprocessor_should_run(
 mod tests {
     use super::*;
     use std::str::FromStr;
-    use toml::value::{Table, Value};
+    use toml::value::Table;
 
     #[test]
     fn config_defaults_to_html_renderer_if_empty() {
@@ -720,7 +780,7 @@ mod tests {
                 for preprocessor in &preprocessors {
                     eprintln!("  {}", preprocessor.name());
                 }
-                panic!("{} should come before {}", before, after);
+                panic!("{before} should come before {after}");
             }
         };
 
@@ -756,10 +816,9 @@ mod tests {
 
         let preprocessors = determine_preprocessors(&cfg).unwrap();
 
-        assert!(preprocessors
+        assert!(!preprocessors
             .iter()
-            .find(|preprocessor| preprocessor.name() == "random")
-            .is_none());
+            .any(|preprocessor| preprocessor.name() == "random"));
     }
 
     #[test]
@@ -776,10 +835,9 @@ mod tests {
 
         let preprocessors = determine_preprocessors(&cfg).unwrap();
 
-        assert!(preprocessors
+        assert!(!preprocessors
             .iter()
-            .find(|preprocessor| preprocessor.name() == "links")
-            .is_none());
+            .any(|preprocessor| preprocessor.name() == "links"));
     }
 
     #[test]

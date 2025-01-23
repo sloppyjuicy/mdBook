@@ -49,6 +49,7 @@
 
 #![deny(missing_docs)]
 
+use log::{debug, trace, warn};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::env;
@@ -57,7 +58,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use toml::value::Table;
-use toml::{self, Value};
+use toml::Value;
 
 use crate::errors::*;
 use crate::utils::{self, toml_ext::TomlExt};
@@ -144,7 +145,7 @@ impl Config {
                 if let serde_json::Value::Object(ref map) = parsed_value {
                     // To `set` each `key`, we wrap them as `prefix.key`
                     for (k, v) in map {
-                        let full_key = format!("{}.{}", key, k);
+                        let full_key = format!("{key}.{k}");
                         self.set(&full_key, v).expect("unreachable");
                     }
                     return;
@@ -227,10 +228,10 @@ impl Config {
         let value = Value::try_from(value)
             .with_context(|| "Unable to represent the item as a JSON Value")?;
 
-        if index.starts_with("book.") {
-            self.book.update_value(&index[5..], value);
-        } else if index.starts_with("build.") {
-            self.build.update_value(&index[6..], value);
+        if let Some(key) = index.strip_prefix("book.") {
+            self.book.update_value(key, value);
+        } else if let Some(key) = index.strip_prefix("build.") {
+            self.build.update_value(key, value);
         } else {
             self.rest.insert(index, value);
         }
@@ -295,7 +296,7 @@ impl Default for Config {
     }
 }
 
-impl<'de> Deserialize<'de> for Config {
+impl<'de> serde::Deserialize<'de> for Config {
     fn deserialize<D: Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
         let raw = Value::deserialize(de)?;
 
@@ -307,7 +308,7 @@ impl<'de> Deserialize<'de> for Config {
             warn!("`description` under a table called `[book]`, move the `destination` entry");
             warn!("from `[output.html]`, renamed to `build-dir`, under a table called");
             warn!("`[build]`, and it should all work.");
-            warn!("Documentation: http://rust-lang.github.io/mdBook/format/config.html");
+            warn!("Documentation: https://rust-lang.github.io/mdBook/format/config.html");
             return Ok(Config::from_legacy(raw));
         }
 
@@ -371,15 +372,8 @@ impl Serialize for Config {
 }
 
 fn parse_env(key: &str) -> Option<String> {
-    const PREFIX: &str = "MDBOOK_";
-
-    if key.starts_with(PREFIX) {
-        let key = &key[PREFIX.len()..];
-
-        Some(key.to_lowercase().replace("__", ".").replace("_", "-"))
-    } else {
-        None
-    }
+    key.strip_prefix("MDBOOK_")
+        .map(|key| key.to_lowercase().replace("__", ".").replace('_', "-"))
 }
 
 fn is_legacy_format(table: &Value) -> bool {
@@ -417,6 +411,9 @@ pub struct BookConfig {
     pub multilingual: bool,
     /// The main language of the book.
     pub language: Option<String>,
+    /// The direction of text in the book: Left-to-right (LTR) or Right-to-left (RTL).
+    /// When not specified, the text direction is derived from [`BookConfig::language`].
+    pub text_direction: Option<TextDirection>,
 }
 
 impl Default for BookConfig {
@@ -428,6 +425,43 @@ impl Default for BookConfig {
             src: PathBuf::from("src"),
             multilingual: false,
             language: Some(String::from("en")),
+            text_direction: None,
+        }
+    }
+}
+
+impl BookConfig {
+    /// Gets the realized text direction, either from [`BookConfig::text_direction`]
+    /// or derived from [`BookConfig::language`], to be used by templating engines.
+    pub fn realized_text_direction(&self) -> TextDirection {
+        if let Some(direction) = self.text_direction {
+            direction
+        } else {
+            TextDirection::from_lang_code(self.language.as_deref().unwrap_or_default())
+        }
+    }
+}
+
+/// Text direction to use for HTML output
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TextDirection {
+    /// Left to right.
+    #[serde(rename = "ltr")]
+    LeftToRight,
+    /// Right to left
+    #[serde(rename = "rtl")]
+    RightToLeft,
+}
+
+impl TextDirection {
+    /// Gets the text direction from language code
+    pub fn from_lang_code(code: &str) -> Self {
+        match code {
+            // list sourced from here: https://github.com/abarrak/rtl/blob/master/lib/rtl/core.rb#L16
+            "ar" | "ara" | "arc" | "ae" | "ave" | "egy" | "he" | "heb" | "nqo" | "pal" | "phn"
+            | "sam" | "syc" | "syr" | "fa" | "per" | "fas" | "ku" | "kur" | "ur" | "urd"
+            | "pus" | "ps" | "yi" | "yid" => TextDirection::RightToLeft,
+            _ => TextDirection::LeftToRight,
         }
     }
 }
@@ -444,6 +478,8 @@ pub struct BuildConfig {
     /// Should the default preprocessors always be used when they are
     /// compatible with the renderer?
     pub use_default_preprocessors: bool,
+    /// Extra directories to trigger rebuild when watching/serving
+    pub extra_watch_dirs: Vec<PathBuf>,
 }
 
 impl Default for BuildConfig {
@@ -452,6 +488,7 @@ impl Default for BuildConfig {
             build_dir: PathBuf::from("book"),
             create_missing: true,
             use_default_preprocessors: true,
+            extra_watch_dirs: Vec::new(),
         }
     }
 }
@@ -467,6 +504,9 @@ pub struct RustConfig {
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 /// Rust edition to use for the code.
 pub enum RustEdition {
+    /// The 2024 edition of Rust
+    #[serde(rename = "2024")]
+    E2024,
     /// The 2021 edition of Rust
     #[serde(rename = "2021")]
     E2021,
@@ -489,7 +529,9 @@ pub struct HtmlConfig {
     /// The theme to use if the browser requests the dark version of the site.
     /// Defaults to 'navy'.
     pub preferred_dark_theme: Option<String>,
-    /// Use "smart quotes" instead of the usual `"` character.
+    /// Supports smart quotes, apostrophes, ellipsis, en-dash, and em-dash.
+    pub smart_punctuation: bool,
+    /// Deprecated alias for `smart_punctuation`.
     pub curly_quotes: bool,
     /// Should mathjax be enabled?
     pub mathjax_support: bool,
@@ -507,6 +549,8 @@ pub struct HtmlConfig {
     /// Playground settings.
     #[serde(alias = "playpen")]
     pub playground: Playground,
+    /// Code settings.
+    pub code: Code,
     /// Print settings.
     pub print: Print,
     /// Don't render section labels.
@@ -533,14 +577,13 @@ pub struct HtmlConfig {
     /// directly jumping to editing the currently viewed page.
     /// Contains {path} that is replaced with chapter source file path
     pub edit_url_template: Option<String>,
-    /// This is used as a bit of a workaround for the `mdbook serve` command.
-    /// Basically, because you set the websocket port from the command line, the
-    /// `mdbook serve` command needs a way to let the HTML renderer know where
-    /// to point livereloading at, if it has been enabled.
+    /// Endpoint of websocket, for livereload usage. Value loaded from .toml
+    /// file is ignored, because our code overrides this field with an
+    /// internal value (`LIVE_RELOAD_ENDPOINT)
     ///
     /// This config item *should not be edited* by the end user.
     #[doc(hidden)]
-    pub livereload_url: Option<String>,
+    pub live_reload_endpoint: Option<String>,
     /// The mapping from old pages to new pages/URLs to use when generating
     /// redirects.
     pub redirect: HashMap<String, String>,
@@ -552,6 +595,7 @@ impl Default for HtmlConfig {
             theme: None,
             default_theme: None,
             preferred_dark_theme: None,
+            smart_punctuation: false,
             curly_quotes: false,
             mathjax_support: false,
             copy_fonts: true,
@@ -560,6 +604,7 @@ impl Default for HtmlConfig {
             additional_js: Vec::new(),
             fold: Fold::default(),
             playground: Playground::default(),
+            code: Code::default(),
             print: Print::default(),
             no_section_label: false,
             search: None,
@@ -569,7 +614,7 @@ impl Default for HtmlConfig {
             input_404: None,
             site_url: None,
             cname: None,
-            livereload_url: None,
+            live_reload_endpoint: None,
             redirect: HashMap::new(),
         }
     }
@@ -584,19 +629,29 @@ impl HtmlConfig {
             None => root.join("theme"),
         }
     }
+
+    /// Returns `true` if smart punctuation is enabled.
+    pub fn smart_punctuation(&self) -> bool {
+        self.smart_punctuation || self.curly_quotes
+    }
 }
 
 /// Configuration for how to render the print icon, print.html, and print.css.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case")]
 pub struct Print {
     /// Whether print support is enabled.
     pub enable: bool,
+    /// Insert page breaks between chapters. Default: `true`.
+    pub page_break: bool,
 }
 
 impl Default for Print {
     fn default() -> Self {
-        Self { enable: true }
+        Self {
+            enable: true,
+            page_break: true,
+        }
     }
 }
 
@@ -612,7 +667,7 @@ pub struct Fold {
     pub level: u8,
 }
 
-/// Configuration for tweaking how the the HTML renderer handles the playground.
+/// Configuration for tweaking how the HTML renderer handles the playground.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Playground {
@@ -625,6 +680,8 @@ pub struct Playground {
     pub copy_js: bool,
     /// Display line numbers on playground snippets. Default: `false`.
     pub line_numbers: bool,
+    /// Display the run button. Default: `true`
+    pub runnable: bool,
 }
 
 impl Default for Playground {
@@ -634,8 +691,17 @@ impl Default for Playground {
             copyable: true,
             copy_js: true,
             line_numbers: false,
+            runnable: true,
         }
     }
+}
+
+/// Configuration for tweaking how the HTML renderer handles code blocks.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Code {
+    /// A prefix string to hide lines per language (one or more chars).
+    pub hidelines: HashMap<String, String>,
 }
 
 /// Configuration of the search functionality of the HTML renderer.
@@ -699,7 +765,7 @@ trait Updateable<'de>: Serialize + Deserialize<'de> {
         let mut raw = Value::try_from(&self).expect("unreachable");
 
         if let Ok(value) = Value::try_from(value) {
-            let _ = raw.insert(key, value);
+            raw.insert(key, value);
         } else {
             return;
         }
@@ -716,6 +782,7 @@ impl<'de, T> Updateable<'de> for T where T: Serialize + Deserialize<'de> {}
 mod tests {
     use super::*;
     use crate::utils::fs::get_404_output_file;
+    use serde_json::json;
 
     const COMPLEX_CONFIG: &str = r#"
         [book]
@@ -734,7 +801,7 @@ mod tests {
         [output.html]
         theme = "./themedir"
         default-theme = "rust"
-        curly-quotes = true
+        smart-punctuation = true
         google-analytics = "123456"
         additional-css = ["./foo/bar/baz.css"]
         git-repository-url = "https://foo.com/"
@@ -764,11 +831,13 @@ mod tests {
             multilingual: true,
             src: PathBuf::from("source"),
             language: Some(String::from("ja")),
+            text_direction: None,
         };
         let build_should_be = BuildConfig {
             build_dir: PathBuf::from("outputs"),
             create_missing: false,
             use_default_preprocessors: true,
+            extra_watch_dirs: Vec::new(),
         };
         let rust_should_be = RustConfig { edition: None };
         let playground_should_be = Playground {
@@ -776,9 +845,10 @@ mod tests {
             copyable: true,
             copy_js: true,
             line_numbers: false,
+            runnable: true,
         };
         let html_should_be = HtmlConfig {
-            curly_quotes: true,
+            smart_punctuation: true,
             google_analytics: Some(String::from("123456")),
             additional_css: vec![PathBuf::from("./foo/bar/baz.css")],
             theme: Some(PathBuf::from("./themedir")),
@@ -804,6 +874,22 @@ mod tests {
         assert_eq!(got.build, build_should_be);
         assert_eq!(got.rust, rust_should_be);
         assert_eq!(got.html_config().unwrap(), html_should_be);
+    }
+
+    #[test]
+    fn disable_runnable() {
+        let src = r#"
+        [book]
+        title = "Some Book"
+        description = "book book book"
+        authors = ["Shogo Takata"]
+
+        [output.html.playground]
+        runnable = false
+        "#;
+
+        let got = Config::from_str(src).unwrap();
+        assert!(!got.html_config().unwrap().playground.runnable);
     }
 
     #[test]
@@ -942,7 +1028,7 @@ mod tests {
         [output.html]
         destination = "my-book" # the output files will be generated in `root/my-book` instead of `root/book`
         theme = "my-theme"
-        curly-quotes = true
+        smart-punctuation = true
         google-analytics = "123456"
         additional-css = ["custom.css", "custom2.css"]
         additional-js = ["custom.js"]
@@ -962,11 +1048,12 @@ mod tests {
             build_dir: PathBuf::from("my-book"),
             create_missing: true,
             use_default_preprocessors: true,
+            extra_watch_dirs: Vec::new(),
         };
 
         let html_should_be = HtmlConfig {
             theme: Some(PathBuf::from("my-theme")),
-            curly_quotes: true,
+            smart_punctuation: true,
             google_analytics: Some(String::from("123456")),
             additional_css: vec![PathBuf::from("custom.css"), PathBuf::from("custom2.css")],
             additional_js: vec![PathBuf::from("custom.js")],
@@ -1012,7 +1099,7 @@ mod tests {
     fn encode_env_var(key: &str) -> String {
         format!(
             "MDBOOK_{}",
-            key.to_uppercase().replace('.', "__").replace("-", "_")
+            key.to_uppercase().replace('.', "__").replace('-', "_")
         )
     }
 
@@ -1036,11 +1123,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::approx_constant)]
     fn update_config_using_env_var_and_complex_value() {
         let mut cfg = Config::default();
         let key = "foo-bar.baz";
-        let value = json!({"array": [1, 2, 3], "number": 3.14});
+        let value = json!({"array": [1, 2, 3], "number": 13.37});
         let value_str = serde_json::to_string(&value).unwrap();
 
         assert!(cfg.get(key).is_none());
@@ -1099,6 +1185,73 @@ mod tests {
     }
 
     #[test]
+    fn text_direction_ltr() {
+        let src = r#"
+        [book]
+        text-direction = "ltr"
+        "#;
+
+        let got = Config::from_str(src).unwrap();
+        assert_eq!(got.book.text_direction, Some(TextDirection::LeftToRight));
+    }
+
+    #[test]
+    fn text_direction_rtl() {
+        let src = r#"
+        [book]
+        text-direction = "rtl"
+        "#;
+
+        let got = Config::from_str(src).unwrap();
+        assert_eq!(got.book.text_direction, Some(TextDirection::RightToLeft));
+    }
+
+    #[test]
+    fn text_direction_none() {
+        let src = r#"
+        [book]
+        "#;
+
+        let got = Config::from_str(src).unwrap();
+        assert_eq!(got.book.text_direction, None);
+    }
+
+    #[test]
+    fn test_text_direction() {
+        let mut cfg = BookConfig::default();
+
+        // test deriving the text direction from language codes
+        cfg.language = Some("ar".into());
+        assert_eq!(cfg.realized_text_direction(), TextDirection::RightToLeft);
+
+        cfg.language = Some("he".into());
+        assert_eq!(cfg.realized_text_direction(), TextDirection::RightToLeft);
+
+        cfg.language = Some("en".into());
+        assert_eq!(cfg.realized_text_direction(), TextDirection::LeftToRight);
+
+        cfg.language = Some("ja".into());
+        assert_eq!(cfg.realized_text_direction(), TextDirection::LeftToRight);
+
+        // test forced direction
+        cfg.language = Some("ar".into());
+        cfg.text_direction = Some(TextDirection::LeftToRight);
+        assert_eq!(cfg.realized_text_direction(), TextDirection::LeftToRight);
+
+        cfg.language = Some("ar".into());
+        cfg.text_direction = Some(TextDirection::RightToLeft);
+        assert_eq!(cfg.realized_text_direction(), TextDirection::RightToLeft);
+
+        cfg.language = Some("en".into());
+        cfg.text_direction = Some(TextDirection::LeftToRight);
+        assert_eq!(cfg.realized_text_direction(), TextDirection::LeftToRight);
+
+        cfg.language = Some("en".into());
+        cfg.text_direction = Some(TextDirection::RightToLeft);
+        assert_eq!(cfg.realized_text_direction(), TextDirection::RightToLeft);
+    }
+
+    #[test]
     #[should_panic(expected = "Invalid configuration file")]
     fn invalid_language_type_error() {
         let src = r#"
@@ -1149,5 +1302,58 @@ mod tests {
         "#;
 
         Config::from_str(src).unwrap();
+    }
+
+    #[test]
+    fn print_config() {
+        let src = r#"
+        [output.html.print]
+        enable = false
+        "#;
+        let got = Config::from_str(src).unwrap();
+        let html_config = got.html_config().unwrap();
+        assert!(!html_config.print.enable);
+        assert!(html_config.print.page_break);
+        let src = r#"
+        [output.html.print]
+        page-break = false
+        "#;
+        let got = Config::from_str(src).unwrap();
+        let html_config = got.html_config().unwrap();
+        assert!(html_config.print.enable);
+        assert!(!html_config.print.page_break);
+    }
+
+    #[test]
+    fn curly_quotes_or_smart_punctuation() {
+        let src = r#"
+        [book]
+        title = "mdBook Documentation"
+
+        [output.html]
+        smart-punctuation = true
+        "#;
+        let config = Config::from_str(src).unwrap();
+        assert_eq!(config.html_config().unwrap().smart_punctuation(), true);
+
+        let src = r#"
+        [book]
+        title = "mdBook Documentation"
+
+        [output.html]
+        curly-quotes = true
+        "#;
+        let config = Config::from_str(src).unwrap();
+        assert_eq!(config.html_config().unwrap().smart_punctuation(), true);
+
+        let src = r#"
+        [book]
+        title = "mdBook Documentation"
+        "#;
+        let config = Config::from_str(src).unwrap();
+        assert_eq!(
+            config.html_config().unwrap_or_default().smart_punctuation(),
+            false
+        );
     }
 }

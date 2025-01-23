@@ -2,7 +2,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use elasticlunr::Index;
+use elasticlunr::{Index, IndexBuilder};
+use once_cell::sync::Lazy;
 use pulldown_cmark::*;
 
 use crate::book::{Book, BookItem};
@@ -10,10 +11,28 @@ use crate::config::Search;
 use crate::errors::*;
 use crate::theme::searcher;
 use crate::utils;
+use log::{debug, warn};
+use serde::Serialize;
+
+const MAX_WORD_LENGTH_TO_INDEX: usize = 80;
+
+/// Tokenizes in the same way as elasticlunr-rs (for English), but also drops long tokens.
+fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || c == '-')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| s.len() <= MAX_WORD_LENGTH_TO_INDEX)
+        .collect()
+}
 
 /// Creates all files required for search.
 pub fn create_files(search_config: &Search, destination: &Path, book: &Book) -> Result<()> {
-    let mut index = Index::new(&["title", "body", "breadcrumbs"]);
+    let mut index = IndexBuilder::new()
+        .add_field_with_tokenizer("title", Box::new(&tokenize))
+        .add_field_with_tokenizer("body", Box::new(&tokenize))
+        .add_field_with_tokenizer("breadcrumbs", Box::new(&tokenize))
+        .build();
+
     let mut doc_urls = Vec::with_capacity(book.sections.len());
 
     for item in book.iter() {
@@ -31,7 +50,7 @@ pub fn create_files(search_config: &Search, destination: &Path, book: &Book) -> 
         utils::fs::write_file(
             destination,
             "searchindex.js",
-            format!("Object.assign(window.search, {});", index).as_bytes(),
+            format!("Object.assign(window.search, {index});").as_bytes(),
         )?;
         utils::fs::write_file(destination, "searcher.js", searcher::JS)?;
         utils::fs::write_file(destination, "mark.min.js", searcher::MARK_JS)?;
@@ -47,11 +66,24 @@ fn add_doc(
     index: &mut Index,
     doc_urls: &mut Vec<String>,
     anchor_base: &str,
-    section_id: &Option<String>,
+    heading: &str,
+    id_counter: &mut HashMap<String, usize>,
+    section_id: &Option<CowStr<'_>>,
     items: &[&str],
 ) {
-    let url = if let Some(ref id) = *section_id {
-        Cow::Owned(format!("{}#{}", anchor_base, id))
+    // Either use the explicit section id the user specified, or generate one
+    // from the heading content.
+    let section_id = section_id.as_ref().map(|id| id.to_string()).or_else(|| {
+        if heading.is_empty() {
+            // In the case where a chapter has no heading, don't set a section id.
+            None
+        } else {
+            Some(utils::unique_id_from_content(heading, id_counter))
+        }
+    });
+
+    let url = if let Some(id) = section_id {
+        Cow::Owned(format!("{anchor_base}#{id}"))
     } else {
         Cow::Borrowed(anchor_base)
     };
@@ -97,9 +129,10 @@ fn render_item(
 
     breadcrumbs.push(chapter.name.clone());
 
+    let mut id_counter = HashMap::new();
     while let Some(event) = p.next() {
         match event {
-            Event::Start(Tag::Heading(i, ..)) if i as u32 <= max_section_depth => {
+            Event::Start(Tag::Heading { level, id, .. }) if level as u32 <= max_section_depth => {
                 if !heading.is_empty() {
                     // Section finished, the next heading is following now
                     // Write the data to the index, and clear it for the next section
@@ -107,20 +140,21 @@ fn render_item(
                         index,
                         doc_urls,
                         &anchor_base,
+                        &heading,
+                        &mut id_counter,
                         &section_id,
                         &[&heading, &body, &breadcrumbs.join(" » ")],
                     );
-                    section_id = None;
                     heading.clear();
                     body.clear();
                     breadcrumbs.pop();
                 }
 
+                section_id = id;
                 in_heading = true;
             }
-            Event::End(Tag::Heading(i, ..)) if i as u32 <= max_section_depth => {
+            Event::End(TagEnd::Heading(level)) if level as u32 <= max_section_depth => {
                 in_heading = false;
-                section_id = Some(utils::id_from_content(&heading));
                 breadcrumbs.push(heading.clone());
             }
             Event::Start(Tag::FootnoteDefinition(name)) => {
@@ -137,8 +171,18 @@ fn render_item(
                     html_block.push_str(html);
                     p.next();
                 }
-
                 body.push_str(&clean_html(&html_block));
+            }
+            Event::InlineHtml(html) => {
+                // This is not capable of cleaning inline tags like
+                // `foo <script>…</script>`. The `<script>` tags show up as
+                // individual InlineHtml events, and the content inside is
+                // just a regular Text event. There isn't a very good way to
+                // know how to collect all the content in-between. I'm not
+                // sure if this is easily fixable. It should be extremely
+                // rare, since script and style tags should almost always be
+                // blocks, and worse case you have some noise in the index.
+                body.push_str(&clean_html(&html));
             }
             Event::Start(_) | Event::End(_) | Event::Rule | Event::SoftBreak | Event::HardBreak => {
                 // Insert spaces where HTML output would usually separate text
@@ -159,25 +203,31 @@ fn render_item(
             Event::FootnoteReference(name) => {
                 let len = footnote_numbers.len() + 1;
                 let number = footnote_numbers.entry(name).or_insert(len);
-                body.push_str(&format!(" [{}] ", number));
+                body.push_str(&format!(" [{number}] "));
             }
             Event::TaskListMarker(_checked) => {}
         }
     }
 
     if !body.is_empty() || !heading.is_empty() {
-        if heading.is_empty() {
+        let title = if heading.is_empty() {
             if let Some(chapter) = breadcrumbs.first() {
-                heading = chapter.clone();
+                chapter
+            } else {
+                ""
             }
-        }
+        } else {
+            &heading
+        };
         // Make sure the last section is added to the index
         add_doc(
             index,
             doc_urls,
             &anchor_base,
+            &heading,
+            &mut id_counter,
             &section_id,
-            &[&heading, &body, &breadcrumbs.join(" » ")],
+            &[title, &body, &breadcrumbs.join(" » ")],
         );
     }
 
@@ -208,12 +258,13 @@ fn write_to_json(index: Index, search_config: &Search, doc_urls: Vec<String>) ->
 
     let mut fields = BTreeMap::new();
     let mut opt = SearchOptionsField::default();
-    opt.boost = Some(search_config.boost_title);
-    fields.insert("title".into(), opt);
-    opt.boost = Some(search_config.boost_paragraph);
-    fields.insert("body".into(), opt);
-    opt.boost = Some(search_config.boost_hierarchy);
-    fields.insert("breadcrumbs".into(), opt);
+    let mut insert_boost = |key: &str, boost| {
+        opt.boost = Some(boost);
+        fields.insert(key.into(), opt);
+    };
+    insert_boost("title", search_config.boost_title);
+    insert_boost("body", search_config.boost_paragraph);
+    insert_boost("breadcrumbs", search_config.boost_hierarchy);
 
     let search_options = SearchOptions {
         bool: if search_config.use_boolean_and {
@@ -246,21 +297,19 @@ fn write_to_json(index: Index, search_config: &Search, doc_urls: Vec<String>) ->
 }
 
 fn clean_html(html: &str) -> String {
-    lazy_static! {
-        static ref AMMONIA: ammonia::Builder<'static> = {
-            let mut clean_content = HashSet::new();
-            clean_content.insert("script");
-            clean_content.insert("style");
-            let mut builder = ammonia::Builder::new();
-            builder
-                .tags(HashSet::new())
-                .tag_attributes(HashMap::new())
-                .generic_attributes(HashSet::new())
-                .link_rel(None)
-                .allowed_classes(HashMap::new())
-                .clean_content_tags(clean_content);
-            builder
-        };
-    }
+    static AMMONIA: Lazy<ammonia::Builder<'static>> = Lazy::new(|| {
+        let mut clean_content = HashSet::new();
+        clean_content.insert("script");
+        clean_content.insert("style");
+        let mut builder = ammonia::Builder::new();
+        builder
+            .tags(HashSet::new())
+            .tag_attributes(HashMap::new())
+            .generic_attributes(HashSet::new())
+            .link_rel(None)
+            .allowed_classes(HashMap::new())
+            .clean_content_tags(clean_content);
+        builder
+    });
     AMMONIA.clean(html).to_string()
 }
